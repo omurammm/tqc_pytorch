@@ -1,3 +1,27 @@
+
+
+```
+sudo apt install libgl1-mesa-dev libgl1-mesa-glx libglew-dev libopengl0
+conda install -c anaconda patchelf
+```
+bottom: 0-4
+top: 0-4
+meaen: 0-4
+
+```
+for i in 0 1 2 3 4
+do
+    for j in 0 1 2 3 4
+    do
+        for k in 0
+        do
+            python main.py --env Walker2d-v2 --bottom_quantiles_to_drop_per_net $i --top_quantiles_to_drop_per_net $j --move_mean_quantiles $k &
+        done
+    done
+done
+```
+
+---
 # Controlling Overestimation Bias with Truncated Mixture of Continuous Distributional Quantile Critics
 
 <img src="https://github.com/bayesgroup/bayesgroup.github.io/blob/master/tqc/assets/tqc/main_exps_pytorch.svg">

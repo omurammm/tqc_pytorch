@@ -5,6 +5,7 @@ import argparse
 import os
 import copy
 from pathlib import Path
+import time
 
 
 from tqc import structures, DEVICE
@@ -28,6 +29,7 @@ def main(args, results_dir, models_dir, prefix):
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
+    print(env.observation_space.shape, env.action_space.shape)
 
     replay_buffer = structures.ReplayBuffer(state_dim, action_dim)
     actor = Actor(state_dim, action_dim).to(DEVICE)
@@ -35,11 +37,14 @@ def main(args, results_dir, models_dir, prefix):
     critic_target = copy.deepcopy(critic)
 
     top_quantiles_to_drop = args.top_quantiles_to_drop_per_net * args.n_nets
+    bottom_quantiles_to_drop = args.bottom_quantiles_to_drop_per_net * args.n_nets
 
     trainer = Trainer(actor=actor,
                       critic=critic,
                       critic_target=critic_target,
                       top_quantiles_to_drop=top_quantiles_to_drop,
+                      bottom_quantiles_to_drop=bottom_quantiles_to_drop,
+                      move_mean_quantiles=args.move_mean_quantiles,
                       discount=args.discount,
                       tau=args.tau,
                       target_entropy=-np.prod(env.action_space.shape).item())
@@ -49,6 +54,9 @@ def main(args, results_dir, models_dir, prefix):
     episode_return = 0
     episode_timesteps = 0
     episode_num = 0
+
+    st = time.time()
+    total_st = time.time()
 
     actor.train()
     for t in range(int(args.max_timesteps)):
@@ -67,7 +75,7 @@ def main(args, results_dir, models_dir, prefix):
 
         if done or episode_timesteps >= EPISODE_LENGTH:
             # +1 to account for 0 indexing. +0 on ep_timesteps since it will increment +1 even if done=True
-            print(f"Total T: {t + 1} Episode Num: {episode_num + 1} Episode T: {episode_timesteps} Reward: {episode_return:.3f}")
+            print(f"Total T: {t + 1} Episode Num: {episode_num + 1} Episode T: {episode_timesteps} Reward: {episode_return:.3f} Time: {time.time() - st:.1f}s Total: {time.time() - total_st:.1f}s")
             # Reset environment
             state, done = env.reset(), False
 
@@ -75,29 +83,37 @@ def main(args, results_dir, models_dir, prefix):
             episode_timesteps = 0
             episode_num += 1
 
+            st = time.time()
+
         # Evaluate episode
         if (t + 1) % args.eval_freq == 0:
+            eval_st = time.time()
             file_name = f"{prefix}_{args.env}_{args.seed}"
             evaluations.append(eval_policy(actor, eval_env, EPISODE_LENGTH))
             np.save(results_dir / file_name, evaluations)
             if args.save_model: trainer.save(models_dir / file_name)
+            st += time.time() - eval_st
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default="Humanoid-v3")          # OpenAI gym environment name
     parser.add_argument("--eval_freq", default=1e3, type=int)       # How often (time steps) we evaluate
-    parser.add_argument("--max_timesteps", default=1e6, type=int)   # Max time steps to run environment
+    parser.add_argument("--max_timesteps", default=5e6, type=int)   # Max time steps to run environment
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--n_quantiles", default=25, type=int)
+    parser.add_argument("--bottom_quantiles_to_drop_per_net", default=0, type=int)
     parser.add_argument("--top_quantiles_to_drop_per_net", default=2, type=int)
-    parser.add_argument("--n_nets", default=5, type=int)
+    parser.add_argument("--move_mean_quantiles", default=0, type=int)  # How many tiles we move the center one
+    parser.add_argument("--n_nets", default=3, type=int)
     parser.add_argument("--batch_size", default=256, type=int)      # Batch size for both actor and critic
     parser.add_argument("--discount", default=0.99, type=float)                 # Discount factor
     parser.add_argument("--tau", default=0.005, type=float)                     # Target network update rate
     parser.add_argument("--log_dir", default='.')
-    parser.add_argument("--prefix", default='')
+    parser.add_argument("--run_num", default=1)
+    # parser.add_argument("--prefix", default='')
     parser.add_argument("--save_model", action="store_true")        # Save model and optimizer parameters
+
     args = parser.parse_args()
 
     log_dir = Path(args.log_dir)
@@ -110,4 +126,7 @@ if __name__ == "__main__":
     if args.save_model and not os.path.exists(models_dir):
         os.makedirs(models_dir)
 
-    main(args, results_dir, models_dir, args.prefix)
+    prefix = f'bottom{args.bottom_quantiles_to_drop_per_net}_top{args.top_quantiles_to_drop_per_net}_mean{args.move_mean_quantiles}_run{args.run_num}'
+
+
+    main(args, results_dir, models_dir, prefix)

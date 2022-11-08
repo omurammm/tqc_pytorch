@@ -14,6 +14,8 @@ class Trainer(object):
 		discount,
 		tau,
 		top_quantiles_to_drop,
+		bottom_quantiles_to_drop,
+		move_mean_quantiles,
 		target_entropy,
 	):
 		self.actor = actor
@@ -28,7 +30,11 @@ class Trainer(object):
 
 		self.discount = discount
 		self.tau = tau
+		
 		self.top_quantiles_to_drop = top_quantiles_to_drop
+		self.bottom_quantiles_to_drop = bottom_quantiles_to_drop
+		self.move_mean_quantiles = move_mean_quantiles
+
 		self.target_entropy = target_entropy
 
 		self.quantiles_total = critic.n_quantiles * critic.n_nets
@@ -47,7 +53,25 @@ class Trainer(object):
 			# compute and cut quantiles at the next state
 			next_z = self.critic_target(next_state, new_next_action)  # batch x nets x quantiles
 			sorted_z, _ = torch.sort(next_z.reshape(batch_size, -1))
-			sorted_z_part = sorted_z[:, :self.quantiles_total-self.top_quantiles_to_drop]
+			sorted_z_part = sorted_z[:, self.bottom_quantiles_to_drop:self.quantiles_total-self.top_quantiles_to_drop]
+			center_quantile_idx = (sorted_z_part.shape[1] // 2) + 1
+			center_quantiles = sorted_z_part[:, center_quantile_idx]
+			move_target_quantiles = sorted_z_part[:, center_quantile_idx - self.move_mean_quantiles]
+			move_diff = center_quantiles - move_target_quantiles
+			move_diff = move_diff.unsqueeze(1).repeat(1, sorted_z_part.shape[1])
+			# print(sorted_z_part)
+			# print(sorted_z_part.shape)
+			# print('center')
+			# print(center_quantiles, center_quantiles.shape)
+			# print('target')
+			# print(move_target_quantiles, move_target_quantiles.shape)
+			# print('diff')
+			# print(move_diff, move_diff.shape)
+
+			sorted_z_part = sorted_z_part - move_diff
+
+			# mean = torch.mean(sorted_z_part, dim=1).unsqueeze(1).repeat(1, sorted_z_part.shape[1])
+			# sorted_z_part = sorted_z_part - (mean * self.move_mean_quantiles)
 
 			# compute target
 			target = reward + not_done * self.discount * (sorted_z_part - alpha * next_log_pi)

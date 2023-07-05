@@ -2,11 +2,15 @@ import torch
 
 from tqc.functions import quantile_huber_loss_f
 from tqc import DEVICE
+from scipy.stats import norm
+import numpy as np
+import wandb
 
 
 class Trainer(object):
 	def __init__(
 		self,
+		args,
 		*,
 		actor,
 		critic,
@@ -16,7 +20,9 @@ class Trainer(object):
 		top_quantiles_to_drop,
 		bottom_quantiles_to_drop,
 		move_mean_quantiles,
+		move_mean_from_origin,
 		target_entropy,
+		ens_type,
 	):
 		self.actor = actor
 		self.critic = critic
@@ -30,14 +36,28 @@ class Trainer(object):
 
 		self.discount = discount
 		self.tau = tau
+
+		self.ens_type = ens_type
 		
-		self.top_quantiles_to_drop = top_quantiles_to_drop
-		self.bottom_quantiles_to_drop = bottom_quantiles_to_drop
-		self.move_mean_quantiles = move_mean_quantiles
+		if ens_type in ['ave', 'sample']:
+			self.top_quantiles_to_drop = top_quantiles_to_drop
+			self.quantiles_total = critic.n_quantiles
+		else:
+			self.top_quantiles_to_drop = top_quantiles_to_drop * critic.n_nets
+			self.quantiles_total = critic.n_quantiles * critic.n_nets
+		# self.bottom_quantiles_to_drop = bottom_quantiles_to_drop
+		# self.move_mean_quantiles = move_mean_quantiles
+		# self.move_mean_from_origin = move_mean_from_origin
 
 		self.target_entropy = target_entropy
 
-		self.quantiles_total = critic.n_quantiles * critic.n_nets
+		self.qem = args.qem
+		if self.qem:
+			quantile_tau = np.arange(critic.n_quantiles) / critic.n_quantiles + 1 / 2 / critic.n_quantiles
+			X = [[1, norm.ppf(t), norm.ppf(t)**2 - 1, norm.ppf(t)**3 - 3 * norm.ppf(t)] for t in quantile_tau]
+			self.X = torch.tensor(X, device=DEVICE).float()
+		
+		
 
 		self.total_it = 0
 
@@ -52,13 +72,34 @@ class Trainer(object):
 
 			# compute and cut quantiles at the next state
 			next_z = self.critic_target(next_state, new_next_action)  # batch x nets x quantiles
-			sorted_z, _ = torch.sort(next_z.reshape(batch_size, -1))
-			sorted_z_part = sorted_z[:, self.bottom_quantiles_to_drop:self.quantiles_total-self.top_quantiles_to_drop]
-			center_quantile_idx = (sorted_z_part.shape[1] // 2) + 1
-			center_quantiles = sorted_z_part[:, center_quantile_idx]
-			move_target_quantiles = sorted_z_part[:, center_quantile_idx - self.move_mean_quantiles]
-			move_diff = center_quantiles - move_target_quantiles
-			move_diff = move_diff.unsqueeze(1).repeat(1, sorted_z_part.shape[1])
+			if self.ens_type == 'ave':
+				sorted_z, _ = torch.sort(next_z, dim=2) # (batch, nets, tiles)
+				sorted_z = torch.mean(sorted_z, dim=1) # (batch, tiles)
+			elif self.ens_type == 'sample':
+				# TODO: refactor
+				sorted_z, _ = torch.sort(next_z, dim=2) # (batch, nets, tiles)
+				zero_z = torch.zeros((sorted_z.shape[0], sorted_z.shape[2]), dtype=sorted_z.dtype).to(sorted_z.device) # (batch, tiles)
+				for b in range(sorted_z.shape[0]):
+					for t in range(sorted_z.shape[2]):
+						idx = torch.randint(0, sorted_z.shape[1], (1, ))[0]
+						zero_z[b, t] = sorted_z[b, idx, t]
+				sorted_z = zero_z
+			elif self.ens_type == 'tqc':
+				sorted_z, _ = torch.sort(next_z.reshape(batch_size, -1))
+			else:
+				raise ValueError
+			# sorted_z_part = sorted_z[:, self.bottom_quantiles_to_drop:self.quantiles_total-self.top_quantiles_to_drop]
+			sorted_z_part = sorted_z[:, :self.quantiles_total-self.top_quantiles_to_drop]
+			# center_quantile_idx = (sorted_z_part.shape[1] // 2) + 1
+			# center_quantile = sorted_z_part[:, center_quantile_idx]
+			# move_target_quantile = sorted_z_part[:, center_quantile_idx - self.move_mean_quantiles]
+			# move_diff = center_quantile - move_target_quantile
+			# move_diff = move_diff.unsqueeze(1).repeat(1, sorted_z_part.shape[1])
+
+			# if self.move_mean_from_origin:
+			# 	mean_diff = torch.mean(sorted_z_part, dim=1) - torch.mean(sorted_z, dim=1)
+			# 	mean_diff = mean_diff.unsqueeze(1).repeat(1, sorted_z_part.shape[1])
+			# 	sorted_z_part = sorted_z_part - mean_diff
 			# print(sorted_z_part)
 			# print(sorted_z_part.shape)
 			# print('center')
@@ -68,7 +109,7 @@ class Trainer(object):
 			# print('diff')
 			# print(move_diff, move_diff.shape)
 
-			sorted_z_part = sorted_z_part - move_diff
+			# sorted_z_part = sorted_z_part - move_diff
 
 			# mean = torch.mean(sorted_z_part, dim=1).unsqueeze(1).repeat(1, sorted_z_part.shape[1])
 			# sorted_z_part = sorted_z_part - (mean * self.move_mean_quantiles)
@@ -82,7 +123,21 @@ class Trainer(object):
 		# --- Policy and alpha loss ---
 		new_action, log_pi = self.actor(state)
 		alpha_loss = -self.log_alpha * (log_pi + self.target_entropy).detach().mean()
-		actor_loss = (alpha * log_pi - self.critic(state, new_action).mean(2).mean(1, keepdim=True)).mean()
+		if self.qem:
+			z = self.critic(state, new_action) # (batch, net, tiles)
+			sorted_z, _ = torch.sort(z, dim=2) # (batch, nets, tiles)
+			n_quantiles = sorted_z.shape[-1]
+			std = sorted_z.reshape(-1, n_quantiles).std(0) # (tiles,)
+			Q = torch.mean(sorted_z, dim=1).unsqueeze(-1) # (batch, tiles, 1)
+			X = self.X.expand(batch_size, -1, -1) # batch, tiles, 2
+			V = torch.diag(std).expand(batch_size, -1, -1) # (batch, tiles, tiles)
+			M = (X.transpose(1, 2).bmm(V.inverse()).bmm(X)).inverse().bmm(X.transpose(1, 2)).bmm(V.inverse()).bmm(Q) # (batch, 2)
+			q_qem = M[:, 0] # (batch, 1)
+			actor_loss = (alpha * log_pi - q_qem).mean()
+			for i in range(n_quantiles):
+				wandb.log({f'std_for_tiles_{i}': std[i]})
+		else:
+			actor_loss = (alpha * log_pi - self.critic(state, new_action).mean(2).mean(1, keepdim=True)).mean()
 
 		# --- Update ---
 		self.critic_optimizer.zero_grad()
@@ -114,10 +169,10 @@ class Trainer(object):
 
 	def load(self, filename):
 		filename = str(filename)
-		self.critic.load_state_dict(torch.load(filename + "_critic"))
-		self.critic_target.load_state_dict(torch.load(filename + "_critic_target"))
-		self.critic_optimizer.load_state_dict(torch.load(filename + "_critic_optimizer"))
-		self.actor.load_state_dict(torch.load(filename + "_actor"))
-		self.actor_optimizer.load_state_dict(torch.load(filename + "_actor_optimizer"))
-		self.log_alpha = torch.load(filename + '_log_alpha')
-		self.alpha_optimizer.load_state_dict(torch.load(filename + "_alpha_optimizer"))
+		self.critic.load_state_dict(torch.load(filename + "_critic", map_location=DEVICE))
+		self.critic_target.load_state_dict(torch.load(filename + "_critic_target", map_location=DEVICE))
+		self.critic_optimizer.load_state_dict(torch.load(filename + "_critic_optimizer", map_location=DEVICE))
+		self.actor.load_state_dict(torch.load(filename + "_actor", map_location=DEVICE))
+		self.actor_optimizer.load_state_dict(torch.load(filename + "_actor_optimizer", map_location=DEVICE))
+		self.log_alpha = torch.load(filename + '_log_alpha', map_location=DEVICE)
+		self.alpha_optimizer.load_state_dict(torch.load(filename + "_alpha_optimizer", map_location=DEVICE))

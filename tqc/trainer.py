@@ -127,15 +127,18 @@ class Trainer(object):
 			z = self.critic(state, new_action) # (batch, net, tiles)
 			sorted_z, _ = torch.sort(z, dim=2) # (batch, nets, tiles)
 			n_quantiles = sorted_z.shape[-1]
-			std = sorted_z.reshape(-1, n_quantiles).std(0) # (tiles,)
+			std = sorted_z.std(1) # (batch, tiles,)
 			Q = torch.mean(sorted_z, dim=1).unsqueeze(-1) # (batch, tiles, 1)
 			X = self.X.expand(batch_size, -1, -1) # batch, tiles, 2
-			V = torch.diag(std).expand(batch_size, -1, -1) # (batch, tiles, tiles)
+			V = torch.diag_embed(std) # (batch, tiles, tiles)
 			M = (X.transpose(1, 2).bmm(V.inverse()).bmm(X)).inverse().bmm(X.transpose(1, 2)).bmm(V.inverse()).bmm(Q) # (batch, 2)
 			q_qem = M[:, 0] # (batch, 1)
 			actor_loss = (alpha * log_pi - q_qem).mean()
-			for i in range(n_quantiles):
-				wandb.log({f'std_for_tiles_{i}': std[i]})
+			if self.total_it % 200 == 0:
+				log_dict = {}
+				for i in range(n_quantiles):
+					log_dict[f'std_for_tiles_{str(i).zfill(2)}'] = std[0][i]
+				wandb.log(log_dict, step=self.total_it)
 		else:
 			actor_loss = (alpha * log_pi - self.critic(state, new_action).mean(2).mean(1, keepdim=True)).mean()
 

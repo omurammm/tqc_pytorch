@@ -18,6 +18,7 @@ import wandb
 
 EPISODE_LENGTH = 1000
 
+torch.set_num_threads(1)
 
 def main(args, results_dir, models_dir, prefix):
     # --- Init ---
@@ -121,7 +122,7 @@ def main(args, results_dir, models_dir, prefix):
         if (t + 1) % args.eval_freq == 0:
             eval_st = time.time()
             evaluations.append(eval_policy(actor, eval_env, EPISODE_LENGTH))
-            wandb.log({'evaluation_return': evaluations[-1]})
+            wandb.log({'evaluation_return': evaluations[-1]}, step=t+1)
             np.save(results_dir / file_name, evaluations)
             st += time.time() - eval_st
         if args.save_model and (t + 1) % args.save_model_freq == 0:
@@ -154,7 +155,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_transition_mode", action="store_true")
     parser.add_argument("--save_transition_dir", default='models/test')
 
-    parser.add_argument("--start_training_data", default=256, type=int)
+    parser.add_argument("--start_training_data", default=5000, type=int)
     parser.add_argument("--utd", default=1, type=int)
 
     parser.add_argument("--ens_type", default='tqc', choices=['tqc', 'ave', 'sample'])
@@ -179,7 +180,7 @@ if __name__ == "__main__":
     if args.utd > 1:
         args.max_timesteps = int(args.max_timesteps / 10)
         args.eval_freq = int(args.eval_freq / 10)
-        args.start_training_data = 5000
+        # args.start_training_data = 5000
         
 
     if args.seed == -1:
@@ -227,4 +228,4 @@ if __name__ == "__main__":
     # python main.py --env Walker2d-v2 --bottom_quantiles_to_drop_per_net 0 --top_quantiles_to_drop_per_net 2 --move_mean_quantiles 0 --move_mean_from_origin --seed 0 --utd 20 --max_timesteps 30000000 --save_model_freq 10000 --start_training_data 5000
 
     # CUDA_VISIBLE_DEVICES="0" python main.py --env Ant-v3 --top_quantiles_to_drop_per_net 2 --n_nets 5 --ave_tiles --utd 1
-    # CUDA_VISIBLE_DEVICES="0" python main.py --env Ant-v3 --top_quantiles_to_drop_per_net 2 --ens_type sample --qem
+    # CUDA_VISIBLE_DEVICES="0" python main.py --env Ant-v3 --n_nets 10 --ens_type ave --qem

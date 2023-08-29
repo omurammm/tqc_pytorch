@@ -39,7 +39,8 @@ class Trainer(object):
 
 		self.ens_type = ens_type
 		
-		if ens_type in ['ave', 'sample']:
+		# if ens_type in ['ave', 'sample']:
+		if ens_type != 'tqc':
 			self.top_quantiles_to_drop = top_quantiles_to_drop
 			self.quantiles_total = critic.n_quantiles
 		else:
@@ -51,11 +52,25 @@ class Trainer(object):
 
 		self.target_entropy = target_entropy
 
-		self.qem = args.qem
-		if self.qem:
+		# self.qem = args.qem
+		if ens_type in ['qem_wls', 'qem_ols']:
 			quantile_tau = np.arange(critic.n_quantiles) / critic.n_quantiles + 1 / 2 / critic.n_quantiles
-			X = [[1, norm.ppf(t), norm.ppf(t)**2 - 1, norm.ppf(t)**3 - 3 * norm.ppf(t)] for t in quantile_tau]
+			tau_expand = np.array([t for _ in range(critic.n_nets) for t in quantile_tau])
+			if args.reg_dim == 4:
+				X = [[1, norm.ppf(t), norm.ppf(t)**2 - 1, norm.ppf(t)**3 - 3 * norm.ppf(t)] for t in tau_expand]
+				self.X_pred = [[1, norm.ppf(t), norm.ppf(t)**2 - 1, norm.ppf(t)**3 - 3 * norm.ppf(t)] for t in quantile_tau]
+			elif args.reg_dim == 3:
+				X = [[1, norm.ppf(t), norm.ppf(t)**2 - 1] for t in tau_expand]
+				self.X_pred = [[1, norm.ppf(t), norm.ppf(t)**2 - 1] for t in quantile_tau]
+			elif args.reg_dim == 2:
+				X = [[1, norm.ppf(t)] for t in tau_expand]
+				self.X_pred = [[1, norm.ppf(t)] for t in quantile_tau]
+			else:
+				raise ValueError
 			self.X = torch.tensor(X, device=DEVICE).float()
+			self.n_quantiles = critic.n_quantiles
+			self.n_nets = critic.n_nets
+			self.no_sort_qem = args.no_sort_qem
 		
 		
 
@@ -84,6 +99,35 @@ class Trainer(object):
 						idx = torch.randint(0, sorted_z.shape[1], (1, ))[0]
 						zero_z[b, t] = sorted_z[b, idx, t]
 				sorted_z = zero_z
+			elif self.ens_type == 'qem_wls':
+				if self.no_sort_qem:
+					sorted_z = next_z
+				else:
+					sorted_z, _ = torch.sort(next_z, dim=2) # (batch, nets, tiles)
+				var = sorted_z.var(1) # (batch, tiles,)
+				var = var.repeat(1, self.n_nets) # (batch, tiles*n_nets,)
+				weight = 1 / (var + 1e-8)
+				Q = sorted_z.reshape(batch_size, -1).unsqueeze(-1) # (batch, tiles*n_nets, 1)
+				X = self.X.expand(batch_size, -1, -1) # (batch, tiles*n_nets, qem_dim)
+				W = torch.diag_embed(weight) # (batch, tiles*n_nets, tiles*n_nets)
+				M = (X.transpose(1, 2).bmm(W).bmm(X)).inverse().bmm(X.transpose(1, 2)).bmm(W).bmm(Q) # (batch, qem_dim, 1)
+				X_pred = self.X.expand(batch_size, -1, -1) # (batch, tiles, qem_dim)
+				sorted_z = X_pred.bmm(M) # (batch, tiles, 1)
+				sorted_z = sorted_z.squeeze(-1) # (batch, tiles)
+
+			elif self.ens_type == 'qem_ols':
+				if self.no_sort_qem:
+					sorted_z = next_z
+				else:
+					sorted_z, _ = torch.sort(next_z, dim=2) # (batch, nets, tiles)
+				Q = sorted_z.reshape(batch_size, -1).unsqueeze(-1) # (batch, tiles*n_nets, 1)
+				X = self.X.expand(batch_size, -1, -1) # (batch, tiles*n_nets, qem_dim)
+				M = (X.transpose(1, 2).bmm(X)).inverse().bmm(X.transpose(1, 2)).bmm(Q) # (batch, qem_dim, 1)
+				X_pred = self.X.expand(batch_size, -1, -1) # (batch, tiles, qem_dim)
+				sorted_z = X_pred.bmm(M) # (batch, tiles, 1)
+				sorted_z = sorted_z.squeeze(-1) # (batch, tiles)
+
+
 			elif self.ens_type == 'tqc':
 				sorted_z, _ = torch.sort(next_z.reshape(batch_size, -1))
 			else:
@@ -123,22 +167,33 @@ class Trainer(object):
 		# --- Policy and alpha loss ---
 		new_action, log_pi = self.actor(state)
 		alpha_loss = -self.log_alpha * (log_pi + self.target_entropy).detach().mean()
-		if self.qem:
+
+		if self.ens_type == 'qem_wls':
 			z = self.critic(state, new_action) # (batch, net, tiles)
 			sorted_z, _ = torch.sort(z, dim=2) # (batch, nets, tiles)
-			n_quantiles = sorted_z.shape[-1]
-			std = sorted_z.std(1) # (batch, tiles,)
-			Q = torch.mean(sorted_z, dim=1).unsqueeze(-1) # (batch, tiles, 1)
-			X = self.X.expand(batch_size, -1, -1) # batch, tiles, 2
-			V = torch.diag_embed(std) # (batch, tiles, tiles)
-			M = (X.transpose(1, 2).bmm(V.inverse()).bmm(X)).inverse().bmm(X.transpose(1, 2)).bmm(V.inverse()).bmm(Q) # (batch, 2)
+			var = sorted_z.var(1) # (batch, tiles,)
+			var = var.repeat(1, self.n_nets) # (batch, tiles*n_nets,)
+			weight = 1 / (var + 1e-8)
+			Q = sorted_z.reshape(batch_size, -1).unsqueeze(-1) # (batch, tiles*n_nets, 1)
+			X = self.X.expand(batch_size, -1, -1) # (batch, tiles*n_nets, qem_dim)
+			W = torch.diag_embed(weight) # (batch, tiles*n_nets, tiles*n_nets)
+			M = (X.transpose(1, 2).bmm(W).bmm(X)).inverse().bmm(X.transpose(1, 2)).bmm(W).bmm(Q) # (batch, qem_dim, 1)
 			q_qem = M[:, 0] # (batch, 1)
 			actor_loss = (alpha * log_pi - q_qem).mean()
-			if self.total_it % 200 == 0:
+			if self.total_it % 1000 == 0:
 				log_dict = {}
-				for i in range(n_quantiles):
-					log_dict[f'std_for_tiles_{str(i).zfill(2)}'] = std[0][i]
+				for i in range(self.n_quantiles):
+					log_dict[f'var_for_tiles_{str(i).zfill(2)}'] = float(var[0][i])
 				wandb.log(log_dict, step=self.total_it)
+
+		elif self.ens_type == 'qem_ols':
+			z = self.critic(state, new_action) # (batch, net, tiles)
+			sorted_z, _ = torch.sort(z, dim=2) # (batch, nets, tiles)
+			Q = sorted_z.reshape(batch_size, -1).unsqueeze(-1) # (batch, tiles*n_nets, 1)
+			X = self.X.expand(batch_size, -1, -1) # (batch, tiles*n_nets, qem_dim)
+			M = (X.transpose(1, 2).bmm(X)).inverse().bmm(X.transpose(1, 2)).bmm(Q) # (batch, qem_dim, 1)
+			q_qem = M[:, 0] # (batch, 1)
+			actor_loss = (alpha * log_pi - q_qem).mean()
 		else:
 			actor_loss = (alpha * log_pi - self.critic(state, new_action).mean(2).mean(1, keepdim=True)).mean()
 
